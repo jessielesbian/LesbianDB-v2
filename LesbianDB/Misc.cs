@@ -47,7 +47,6 @@ namespace LesbianDB
 		{
 			return ((await tsk) == val) ^ inv;
 		}
-		private static readonly ConcurrentBag<byte[]> CopyBuffers = new ConcurrentBag<byte[]>();
 
 		public static T SimpleCreate<T>() where T : new(){
 			return new T();
@@ -61,37 +60,6 @@ namespace LesbianDB
 			return val;
 		}
 
-		public static async Task<long> CopyBytes(this Stream inStream, Stream outStream, bool asyncIn, bool asyncOut, long bytesRequired)
-		{
-			long readSoFar = 0;
-
-
-			byte[] buffer = null;
-			try{
-				if (!CopyBuffers.TryTake(out buffer))
-				{
-					buffer = new byte[65536];
-				}
-				do
-				{
-					long toRead = Math.Min(bytesRequired - readSoFar, 65536);
-					long readNow = asyncIn ? await inStream.ReadAsync(buffer, 0, (int)toRead) : inStream.Read(buffer, 0, (int) toRead);
-					if (readNow == 0){
-						break; // End of stream
-					} else if(asyncOut){
-						await outStream.WriteAsync(buffer, 0, (int)readNow);
-					} else{
-						outStream.Write(buffer, 0, (int)readNow);
-					}
-					readSoFar += readNow;
-				} while (readSoFar < bytesRequired);
-			} finally{
-				if(buffer is { }){
-					CopyBuffers.Add(buffer);
-				}
-			}
-			return readSoFar;
-		}
 
 		public static string[] Command2Array(Command command){
 			string[] arr = new string[command.args.Length + 1];

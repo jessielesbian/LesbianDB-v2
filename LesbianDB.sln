@@ -6,8 +6,11 @@ MinimumVisualStudioVersion = 10.0.40219.1
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "LesbianDB", "LesbianDB\LesbianDB.csproj", "{5A3B4FF8-7F84-4A9B-B7DB-5DBF68388C99}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{117C14A1-0E75-489A-A951-A635184A7F1F}"
+	ProjectSection(SolutionItems) = preProject
+		license.md = license.md
+	EndProjectSection
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LesbianDB.Tests", "LesbianDB.Tests\LesbianDB.Tests.csproj", "{4DA0D970-5B79-4B19-B203-2F2CC1614D4C}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "LesbianDB.Tests", "LesbianDB.Tests\LesbianDB.Tests.csproj", "{4DA0D970-5B79-4B19-B203-2F2CC1614D4C}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

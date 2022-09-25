@@ -240,71 +240,16 @@ namespace LesbianDB
 			}
 			commandsEnumerable = null;
 			bool write = binlogCommands.Count > 0;
-			Task binwrite = null;
-			byte[] leased = null;
-
-			//Global database lock
-			if (privilegeLevel < PrivilegeLevel.Binlog){
-				if (write)
-				{
-					if (privilegeLevel == PrivilegeLevel.Reader)
-					{
-						return new TransactionResult("Write privileges required");
-					}
-					await locker.AcquireWriterLock();
-				}
-				else
-				{
-					await locker.AcquireReaderLock();
-				}
-			}
-			
-			try
+			if (write && privilegeLevel == PrivilegeLevel.Reader)
 			{
-				if (unstable)
+				return new TransactionResult("Write privileges required");
+			}
+			byte[] leased = null;
+			int binlogExtension = 0;
+			Task binwrite = null;
+			try{
+				if (binlog is { })
 				{
-					return new TransactionResult("Database restart required");
-				}
-				{
-
-					//Conditional committing allows us to do optimistic locking
-					Queue<Task<bool>> checks = new Queue<Task<bool>>();
-					foreach (Command command in conditions)
-					{
-						switch (command.cmd)
-						{
-							case "DCHECKEQ":
-							case "DCHECKNEQ":
-								if (command.args.Length != 3)
-								{
-									return new TransactionResult(command.cmd + " requires 3 arguments!");
-								}
-								if (asyncDictionaries.TryGetValue(command.args.Span[0], out IAsyncDictionary tad))
-								{
-									checks.Enqueue(Misc.CompareAsync(Misc.Reinterpret(tad.TryGetValue(command.args.Span[1])), command.args.Span[2], command.cmd == "DCHECKNEQ"));
-								}
-								else if (command.args.Span[2] is { })
-								{
-									//This is a SPECIAL ERROR MESSAGE, DO NOT CHANGE!!!
-									return new TransactionResult("REJECTED");
-								}
-								break;
-						}
-					}
-					conditions = null;
-					bool pass = true;
-					while (checks.TryDequeue(out Task<bool> tskpass))
-					{
-						pass &= await tskpass;
-					}
-					if (!pass)
-					{ //This is a SPECIAL ERROR MESSAGE, DO NOT CHANGE!!!
-						return new TransactionResult("REJECTED");
-					}
-				}
-				if (write && (binlog is { }) && (privilegeLevel < PrivilegeLevel.Binlog))
-				{
-					int len;
 					using (Stream memoryStream = new MemoryStream())
 					{
 						using (Stream deflateStream = new DeflateStream(memoryStream, CompressionLevel.Optimal, true))
@@ -315,175 +260,264 @@ namespace LesbianDB
 							jsonSerializer.Serialize(bsonWriter, binlogCommands.ToArray(), typeof(string[][]));
 						}
 						binlogCommands = null;
-						len = (int)memoryStream.Position;
+						binlogExtension = (int)memoryStream.Position;
 						memoryStream.Seek(0, SeekOrigin.Begin);
-						leased = arrayPool.Rent(len + 4);
-						memoryStream.Read(leased, 4, len);
+						leased = arrayPool.Rent(binlogExtension + 4);
+						memoryStream.Read(leased, 4, binlogExtension);
 					}
-					BitConverter.TryWriteBytes(leased.AsSpan(0, 4), (uint)len);
-					binwrite = binlog.WriteAsync(leased, 0, len + 4);
-					if (binlogFlushingInterval == 0)
-					{
-						binwrite = Misc.Chain(binlog.FlushAsync, binwrite);
-					}
+					BitConverter.TryWriteBytes(leased.AsSpan(0, 4), (uint)binlogExtension);
 				}
-
-				Queue<string> returnQueue = new Queue<string>();
-
-				Queue<object> multithreadedReads = new Queue<object>();
-				foreach (WriteCheckedCommand command in commands)
+			optimistic_relock:
+				bool writelocked = false;
+				await locker.AcquireReaderLock();
+				try
 				{
-					if (command.write)
+					if (unstable)
 					{
-						await AwaitMultithreadedReads(multithreadedReads, returnQueue.Enqueue);
+						return new TransactionResult("Database restart required");
 					}
-					object returns;
-					switch (command.cmd)
 					{
-						case "DSET":
+
+						//Conditional committing allows us to do optimistic locking
+						Queue<Task<bool>> checks = new Queue<Task<bool>>();
+						foreach (Command command in conditions)
+						{
+							switch (command.cmd)
 							{
-								string container = command.args.Span[0];
-								if (!asyncDictionaries.TryGetValue(container, out IAsyncDictionary val))
-								{
-									val = dictionaryFactory();
-									asyncDictionaries.Add(container, val);
-								}
-								string set = command.args.Span[2];
-								if (set is null)
-								{
-									returns = Misc.SwitchAsync(val.TryRemove(command.args.Span[1]), "OK", null);
-								}
-								else
-								{
-									returns = Misc.ChainValue(val.SetOrAdd(command.args.Span[1], set), "OK");
-								}
-							}
-							break;
-						case "DGET":
-							{
-								if (asyncDictionaries.TryGetValue(command.args.Span[0], out IAsyncDictionary val))
-								{
-									returns = Misc.Reinterpret(val.TryGetValue(command.args.Span[1]));
-								}
-								else
-								{
-									returns = null;
-								}
-							}
-							break;
-						case "ACREATEUSER":
-							returns = userDescriptors.TryAdd(command.args.Span[0], new UserDescriptor(PrivilegeLevel.Reader, command.args.Span[1])) ? "OK" : null;
-							break;
-						case "ACHANGEPASS":
-							{
-								string user = command.args.Span[0];
-								if (userDescriptors.TryGetValue(user, out UserDescriptor userDescriptor)){
-									if(userDescriptor.privilegeLevel < PrivilegeLevel.Admin){
-										userDescriptors[user] = new UserDescriptor(userDescriptor.privilegeLevel, command.args.Span[1]);
-										returns = "OK";
-										break;
-									}
-								}
-							}
-							returns = null;
-							break;
-						case "ADELETEUSER":
-							{
-								string user = command.args.Span[0];
-								if (userDescriptors.TryGetValue(user, out UserDescriptor userDescriptor))
-								{
-									if(userDescriptor.privilegeLevel < PrivilegeLevel.Admin){
-										userDescriptors.TryRemove(user, out _);
-										returns = "OK";
-										break;
-									}
-								}
-							}
-							returns = null;
-							break;
-						case "AGRANTWRITE":
-							{
-								string user = command.args.Span[0];
-								if (userDescriptors.TryGetValue(user, out UserDescriptor userDescriptor))
-								{
-									if (userDescriptor.privilegeLevel == PrivilegeLevel.Reader)
+								case "DCHECKEQ":
+								case "DCHECKNEQ":
+									if (command.args.Length != 3)
 									{
-										userDescriptors[user] = new UserDescriptor(PrivilegeLevel.Writer, userDescriptor.passhash);
-										returns = "OK";
-										break;
+										return new TransactionResult(command.cmd + " requires 3 arguments!");
 									}
-								}
-							}
-							returns = null;
-							break;
-						case "AREVOKEWRITE":
-							{
-								string user = command.args.Span[0];
-								if (userDescriptors.TryGetValue(user, out UserDescriptor userDescriptor))
-								{
-									if (userDescriptor.privilegeLevel == PrivilegeLevel.Writer)
+									if (asyncDictionaries.TryGetValue(command.args.Span[0], out IAsyncDictionary tad))
 									{
-										userDescriptors[user] = new UserDescriptor(PrivilegeLevel.Reader, userDescriptor.passhash);
-										returns = "OK";
-										break;
+										checks.Enqueue(Misc.CompareAsync(Misc.Reinterpret(tad.TryGetValue(command.args.Span[1])), command.args.Span[2], command.cmd == "DCHECKNEQ"));
+									}
+									else if (command.args.Span[2] is { })
+									{
+										//This is a SPECIAL ERROR MESSAGE, DO NOT CHANGE!!!
+										return new TransactionResult("REJECTED");
+									}
+									break;
+							}
+						}
+						conditions = null;
+						bool pass = true;
+						while (checks.TryDequeue(out Task<bool> tskpass))
+						{
+							pass &= await tskpass;
+						}
+						if (!pass)
+						{ //This is a SPECIAL ERROR MESSAGE, DO NOT CHANGE!!!
+							return new TransactionResult("REJECTED");
+						}
+					}
+
+					if (write && privilegeLevel < PrivilegeLevel.Binlog)
+					{
+						writelocked = await locker.TryUpgradeToWriterLock();
+						if (!writelocked)
+						{
+							goto optimistic_relock;
+						}
+						if (binlog is { })
+						{
+							binwrite = binlog.WriteAsync(leased, 0, binlogExtension + 4);
+							if(binlogFlushingInterval == 0){
+								binwrite = Misc.Chain(binlog.FlushAsync, binwrite);
+							}
+						}
+					}
+
+					Queue<string> returnQueue = new Queue<string>();
+
+					Queue<object> multithreadedReads = new Queue<object>();
+					bool prevwrite = false;
+					foreach (WriteCheckedCommand command in commands)
+					{
+						if (command.write || prevwrite)
+						{
+							await AwaitMultithreadedReads(multithreadedReads, returnQueue.Enqueue);
+						}
+						prevwrite = command.write;
+						object returns;
+						switch (command.cmd)
+						{
+							case "DSET":
+								{
+									string container = command.args.Span[0];
+									if (!asyncDictionaries.TryGetValue(container, out IAsyncDictionary val))
+									{
+										val = dictionaryFactory();
+										asyncDictionaries.Add(container, val);
+									}
+									string set = command.args.Span[2];
+									if (set is null)
+									{
+										returns = Misc.SwitchAsync(val.TryRemove(command.args.Span[1]), "OK", null);
+									}
+									else
+									{
+										returns = Misc.ChainValue(val.SetOrAdd(command.args.Span[1], set), "OK");
 									}
 								}
-							}
-							returns = null;
-							break;
-						default:
+								break;
+							case "DGET":
+								{
+									if (asyncDictionaries.TryGetValue(command.args.Span[0], out IAsyncDictionary val))
+									{
+										returns = Misc.Reinterpret(val.TryGetValue(command.args.Span[1]));
+									}
+									else
+									{
+										returns = null;
+									}
+								}
+								break;
+							case "ACREATEUSER":
+								returns = userDescriptors.TryAdd(command.args.Span[0], new UserDescriptor(PrivilegeLevel.Reader, command.args.Span[1])) ? "OK" : null;
+								break;
+							case "ACHANGEPASS":
+								{
+									string user = command.args.Span[0];
+									if (userDescriptors.TryGetValue(user, out UserDescriptor userDescriptor))
+									{
+										if (userDescriptor.privilegeLevel < PrivilegeLevel.Admin)
+										{
+											userDescriptors[user] = new UserDescriptor(userDescriptor.privilegeLevel, command.args.Span[1]);
+											returns = "OK";
+											break;
+										}
+									}
+								}
+								returns = null;
+								break;
+							case "ADELETEUSER":
+								{
+									string user = command.args.Span[0];
+									if (userDescriptors.TryGetValue(user, out UserDescriptor userDescriptor))
+									{
+										if (userDescriptor.privilegeLevel < PrivilegeLevel.Admin)
+										{
+											userDescriptors.TryRemove(user, out _);
+											returns = "OK";
+											break;
+										}
+									}
+								}
+								returns = null;
+								break;
+							case "AGRANTWRITE":
+								{
+									string user = command.args.Span[0];
+									if (userDescriptors.TryGetValue(user, out UserDescriptor userDescriptor))
+									{
+										if (userDescriptor.privilegeLevel == PrivilegeLevel.Reader)
+										{
+											userDescriptors[user] = new UserDescriptor(PrivilegeLevel.Writer, userDescriptor.passhash);
+											returns = "OK";
+											break;
+										}
+									}
+								}
+								returns = null;
+								break;
+							case "AREVOKEWRITE":
+								{
+									string user = command.args.Span[0];
+									if (userDescriptors.TryGetValue(user, out UserDescriptor userDescriptor))
+									{
+										if (userDescriptor.privilegeLevel == PrivilegeLevel.Writer)
+										{
+											userDescriptors[user] = new UserDescriptor(PrivilegeLevel.Reader, userDescriptor.passhash);
+											returns = "OK";
+											break;
+										}
+									}
+								}
+								returns = null;
+								break;
+							default:
+								throw new Exception("Should not reach here");
+						}
+						if (returns is null || returns is string || returns is Task<string>)
+						{
+							multithreadedReads.Enqueue(returns);
+						}
+						else
+						{
 							throw new Exception("Should not reach here");
+						}
 					}
-					if (returns is null || returns is string || returns is Task<string>)
+					await AwaitMultithreadedReads(multithreadedReads, returnQueue.Enqueue);
+					return new TransactionResult(returnQueue.ToArray());
+				}
+				catch (Exception e)
+				{
+					if (e is UserError)
 					{
-						multithreadedReads.Enqueue(returns);
+						return new TransactionResult(e.Message);
 					}
 					else
 					{
-						throw new Exception("Should not reach here");
+
+						//An unexpected exception can be an indication that something is seriously wrong
+						//For example, and IO exception when accessing swap arenas
+						//We mark the database as unstable, and cause all queries to fail until the database is restarted
+						unstable = true;
+						throw;
 					}
 				}
-				await AwaitMultithreadedReads(multithreadedReads, returnQueue.Enqueue);
-				return new TransactionResult(returnQueue.ToArray());
-			}
-			catch (Exception e)
-			{
-				if (e is UserError)
+				finally
 				{
-					return new TransactionResult(e.Message);
-				}
-				else
-				{
-
-					//An unexpected exception can be an indication that something is seriously wrong
-					//For example, and IO exception when accessing swap arenas
-					//We mark the database as unstable and clear the in-memory stuff
-					unstable = true;
-					throw;
+					if (privilegeLevel < PrivilegeLevel.Binlog)
+					{
+						if (writelocked)
+						{
+							if(binwrite is { }){
+								Task tsk = binwrite;
+								binwrite = null;
+								try{
+									await tsk;
+								} catch{
+									//Binlog writing failure
+									unstable = true;
+									throw;
+								}
+							}
+							locker.ReleaseWriterLock();
+						}
+						else
+						{
+							locker.ReleaseReaderLock();
+						}
+					}
 				}
 			}
+			
 			finally
 			{
-				if(privilegeLevel < PrivilegeLevel.Binlog){
-					if (write)
+				if(write){
+					if (binwrite is { })
 					{
-						if (binwrite is { })
+						try
 						{
-							await binwrite; //Wait for binlog writing
+							await binwrite;
 						}
-						if (leased is { })
+						catch
 						{
-							arrayPool.Return(leased, false);
+							//Binlog writing failure
+							unstable = true;
+							throw;
 						}
-						locker.ReleaseWriterLock();
 					}
-					else
+					if (leased is { })
 					{
-						locker.ReleaseReaderLock();
+						arrayPool.Return(leased, false);
 					}
 				}
 			}
-
 		}
 
 		//More binlog methods
@@ -494,7 +528,6 @@ namespace LesbianDB
 		}
 
 		public Task WaitForBinlog() => loadBinlog ?? Misc.completed;
-
 		private async Task FlushBinlog()
 		{
 			CancellationToken cancellationToken = binlogFlushingCancellation.Token;
@@ -526,15 +559,18 @@ namespace LesbianDB
 			
 			Queue<Command> commands = new Queue<Command>();
 			Dictionary<string, string[]> kvp2 = new Dictionary<string, string[]>();
-			using (Stream memorySteam = new MemoryStream())
+			Stream memorySteam = null;
+			byte[] buffer = null;
+			try
 			{
+				int bufsize = 0;
 			start:
 				long read = await binlog.ReadAsync(lengthctr);
 				if (read != 4)
 				{
-					//[SELF HEALING]: Roll back truncated binlog
-					if (read > 0)
+					if (read > 0 && binlog.CanSeek)
 					{
+						//[SELF HEALING]: Roll back truncated binlog
 						binlog.Seek(-read, SeekOrigin.Current);
 					}
 					goto end;
@@ -542,11 +578,31 @@ namespace LesbianDB
 				long length = BitConverter.ToUInt32(lengthctr.Span);
 				if (length > 0)
 				{
-					read = await binlog.CopyBytes(memorySteam, true, false, length);
+					read = 0;
+					if(buffer is null){
+						buffer = arrayPool.Rent(65536);
+						bufsize = buffer.Length;
+					}
+					do
+					{
+						long toRead = Math.Min(length - read, bufsize);
+						long readNow = await binlog.ReadAsync(buffer, 0, (int)toRead);
+						if (readNow == 0)
+						{
+							break; // End of stream
+						}
+						if(memorySteam is null){
+							memorySteam = new MemoryStream();
+						}
+						memorySteam.Write(buffer, 0, (int)readNow);
+						read += readNow;
+					} while (read < length);
 					if (read != length)
 					{
-						//[SELF HEALING]: Roll back truncated binlog
-						binlog.Seek(-4 - read, SeekOrigin.Current);
+						if(binlog.CanSeek){
+							//[SELF HEALING]: Roll back truncated binlog
+							binlog.Seek(-4 - read, SeekOrigin.Current);
+						}
 						goto end;
 					}
 					//Rewind and truncate memory stream
@@ -573,6 +629,11 @@ namespace LesbianDB
 					}
 					memorySteam.Seek(0, SeekOrigin.Begin);
 					goto start;
+				}
+			} finally{
+				memorySteam?.Dispose();
+				if(buffer is { }){
+					arrayPool.Return(buffer, false);
 				}
 			}
 		end:
